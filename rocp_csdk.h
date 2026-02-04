@@ -10,12 +10,10 @@ extern "C" {
 
 #pragma GCC visibility push(default)
 
-int rocp_csdk_init(void);
-int rocp_csdk_shutdown(void);
-
 int rocp_csdk_start(const char **event_list, int event_count);
 int rocp_csdk_stop();
 int rocp_csdk_read(long long *counters);
+int rocp_csdk_shutdown(void);
 
 #pragma GCC visibility pop
 

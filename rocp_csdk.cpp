@@ -718,12 +718,6 @@ int RocpCSDK::readSample() {
 //--------------------------------------------------------------------------------
 
 extern "C" int
-rocp_csdk_init(void) {
-    // Initialization happens in rocprofiler_configure
-    return RETVAL_SUCCESS;
-}
-
-extern "C" int
 rocp_csdk_shutdown(void) {
     auto& sdk = RocpCSDK::instance();
     sdk.stopCounting();

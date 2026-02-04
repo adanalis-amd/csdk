@@ -39,8 +39,6 @@
 #include <vector>
 #include <algorithm>
 
-#define ROCP_CSDK_DEBUG
-
 #if defined(ROCP_CSDK_DEBUG)
 #define ROCPROFILER_CALL(result, msg)                                                              \
     {                                                                                              \
@@ -51,7 +49,6 @@
             std::cerr << "[" #result "][" << __FILE__ << ":" << __LINE__ << "] " << msg            \
                       << " failed with error code " << CHECKSTATUS << ": " << status_msg           \
                       << std::endl;                                                                \
-/*            std::stringstream errmsg{};       */                                                     \
         }                                                                                          \
     }
 #else
