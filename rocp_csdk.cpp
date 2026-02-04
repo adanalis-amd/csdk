@@ -727,7 +727,7 @@ rocp_csdk_shutdown(void) {
 }
 
 extern "C" int
-rocp_csdk_stop() {
+rocp_csdk_stop(void) {
     auto& sdk = RocpCSDK::instance();
     sdk.stopCounting();
     sdk.emptyActiveEventSet();
