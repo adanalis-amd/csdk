@@ -1,55 +1,47 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include "hip.h"
 #include "rocp_csdk.h"
 
 #define NUM_EVENTS (10)
+#define SAMPLE_INTERVAL_US (80 * 1000)
+#define SHUTDOWN_DELAY_US  (20000)
 
 extern int launch_kernel(int device_id);
 
 
-const char desiredEvents[NUM_EVENTS][128] = { 
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=0:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=1:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=2:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=3:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=4:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=5:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=6:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=7:device=0",
-"CPF_CMP_UTCL1_STALL_ON_TRANSLATION:device=0",
-"SQ_WAVES:device=0"
+const char *desiredEvents[NUM_EVENTS] = {
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=0",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=1",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=2",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=3",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=4",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=5",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=6",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=7",
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION",
+    "SQ_WAVES"
 };
 
-const char **gen_event_list(){
-    const char **event_list;
-    event_list = (const char **)calloc(NUM_EVENTS, sizeof(char *));
-    for(int i=0; i<NUM_EVENTS; i++){
-        event_list[i] = desiredEvents[i];
-    }
-
-    return event_list;
-}
-
-volatile int gv=0;
+atomic_int gv = 0;
 
 void *thread_main(void *arg){
     long long counters[NUM_EVENTS] = { 0 };
-    while(0==gv){;}
+    while(0 == atomic_load(&gv)){;}
     for(int i=0; i<10; i++){
-        printf("Sample: %2d\n", gv);
+        printf("Sample: %2d\n", atomic_load(&gv));
         fflush(stdout);
         rocp_csdk_read(counters);
-        for (int i = 0; i <NUM_EVENTS; ++i) {
-            printf("%s: %lld\n", desiredEvents[i], counters[i]);
+        for (int j = 0; j < NUM_EVENTS; ++j) {
+            printf("%s: %lld\n", desiredEvents[j], counters[j]);
             fflush(stdout);
         }
         printf("\n");
-	fflush(stdout);
-        usleep(80*1000);
-        ++gv;
+        fflush(stdout);
+        usleep(SAMPLE_INTERVAL_US);
+        atomic_fetch_add(&gv, 1);
     }
     return NULL;
 }
@@ -57,23 +49,31 @@ void *thread_main(void *arg){
 
 int main(int argc, char *argv[])
 {
-    int papi_errno;
-
     int dev_count;
     if (hipGetDeviceCount(&dev_count) != hipSuccess){
-        printf("Error while counting AMD devices\n");
+        fprintf(stderr, "Error while counting AMD devices\n");
+        return 1;
     }
 
-    rocp_csdk_start(gen_event_list(), NUM_EVENTS);
+    rocp_csdk_start(desiredEvents, NUM_EVENTS);
 
     pthread_t tid;
-    pthread_create(&tid, NULL, thread_main, NULL);
+    if (pthread_create(&tid, NULL, thread_main, NULL) != 0) {
+        perror("pthread_create failed");
+        rocp_csdk_shutdown();
+        return 1;
+    }
 
     printf("---------------------  launch_kernel(0)\n");
-    gv = 1;
-    papi_errno = launch_kernel(0);
+    atomic_store(&gv, 1);
+    int kernel_ret = launch_kernel(0);
+    if (kernel_ret != 0) {
+        fprintf(stderr, "launch_kernel failed with code %d\n", kernel_ret);
+    }
 
-    usleep(20000);
+    pthread_join(tid, NULL);
+
+    usleep(SHUTDOWN_DELAY_US);
 
     rocp_csdk_stop();
 
