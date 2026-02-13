@@ -5,9 +5,9 @@
 #include "hip.h"
 #include "rocp_csdk.h"
 
-#define NUM_EVENTS (10)
+#define NUM_EVENTS (15)
+//#define NUM_EVENTS (3)
 #define SAMPLE_INTERVAL_US (80 * 1000)
-#define SHUTDOWN_DELAY_US  (20000)
 
 extern int launch_kernel(int device_id);
 
@@ -21,8 +21,13 @@ const char *desiredEvents[NUM_EVENTS] = {
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=5",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=6",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=7",
-    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION",
-    "SQ_WAVES"
+    "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:device=0",
+    "SQ_WAVES:device=0",
+    "SQ_WAVES:device=1",
+    "SQ_WAVES:device=2",
+    "SQ_WAVES:device=3",
+    "SQ_WAVES:device=4",
+    "SQ_WAVES:device=5"
 };
 
 atomic_int gv = 0;
@@ -38,7 +43,7 @@ void *thread_main(void *arg){
             printf("%s: %lld\n", desiredEvents[j], counters[j]);
             fflush(stdout);
         }
-        printf("\n");
+        printf("\n------------------------------------------\n");
         fflush(stdout);
         usleep(SAMPLE_INTERVAL_US);
         atomic_fetch_add(&gv, 1);
@@ -49,11 +54,14 @@ void *thread_main(void *arg){
 
 int main(int argc, char *argv[])
 {
-    int dev_count;
+    int dev_count, which_device=0;
     if (hipGetDeviceCount(&dev_count) != hipSuccess){
         fprintf(stderr, "Error while counting AMD devices\n");
         return 1;
     }
+
+    if( argc > 1 )
+        which_device = (int)strtol(argv[1], NULL, 10);
 
     rocp_csdk_start(desiredEvents, NUM_EVENTS);
 
@@ -64,16 +72,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("---------------------  launch_kernel(0)\n");
+    printf("---------------------  launch_kernel(%d)\n",which_device);
     atomic_store(&gv, 1);
-    int kernel_ret = launch_kernel(0);
+    int kernel_ret = launch_kernel(which_device);
     if (kernel_ret != 0) {
         fprintf(stderr, "launch_kernel failed with code %d\n", kernel_ret);
     }
 
     pthread_join(tid, NULL);
-
-    usleep(SHUTDOWN_DELAY_US);
 
     rocp_csdk_stop();
 

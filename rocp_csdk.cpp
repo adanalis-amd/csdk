@@ -174,11 +174,13 @@ void RocpCSDK::recordCallback(rocprofiler_dispatch_counting_service_data_t dispa
                 continue;
             }
             event_instance_info_t e_inst = e_tmp->second;
+            uint32_t e_id_32 = static_cast<uint32_t>(e_inst.counter_info.id.handle);
 
             for (size_t i = 0; i < record_count; ++i) {
                 rec_info_t& rec_info = event_set_to_rec_mapping[i];
+                uint32_t r_id_32 = static_cast<uint32_t>(rec_info.counter_id.handle);
                 if ((e_inst.device != static_cast<int>(rec_info.device)) ||
-                    (e_inst.counter_info.id.handle != rec_info.counter_id.handle) ||
+                    (e_id_32 != r_id_32) ||
                     !self->dimensionsMatch(e_inst.dim_instances, rec_info.recorded_dims)) {
                     continue;
                 }
@@ -684,17 +686,19 @@ int RocpCSDK::readSample() {
                 continue;
             }
             event_instance_info_t e_inst = tmp_it->second;
+            uint32_t e_id_32 = static_cast<uint32_t>(e_inst.counter_info.id.handle);
 
             for (size_t i = 0; i < rec_count; ++i) {
                 rec_info_t& rec_info = event_set_to_rec_mapping[i];
+                uint32_t r_id_32 = static_cast<uint32_t>(rec_info.counter_id.handle);
                 if ((e_inst.device != static_cast<int>(rec_info.device)) ||
-                    (e_inst.counter_info.id.handle != rec_info.counter_id.handle) ||
+                    (e_id_32 != r_id_32) ||
                     !dimensionsMatch(e_inst.dim_instances, rec_info.recorded_dims)) {
                     continue;
                 }
-
                 index_mapping_[ei * rec_count + i] = true;
             }
+            printf("\n");
         }
     }
 

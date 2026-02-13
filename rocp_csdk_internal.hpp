@@ -174,7 +174,6 @@ private:
                                  void* user_data,
                                  uint64_t drop_count);
 
-    // Member variables (previously global)
     std::atomic<unsigned int> global_event_count_{0};
     std::atomic<unsigned int> base_event_count_{0};
 
