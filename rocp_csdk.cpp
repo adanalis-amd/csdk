@@ -241,6 +241,503 @@ void RocpCSDK::bufferedCallback(rocprofiler_context_id_t,
 }
 
 //--------------------------------------------------------------------------------
+// PC Sampling Implementation
+//--------------------------------------------------------------------------------
+
+void RocpCSDK::pcSamplingCallback(rocprofiler_context_id_t,
+                                   rocprofiler_buffer_id_t,
+                                   rocprofiler_record_header_t** headers,
+                                   size_t num_headers,
+                                   void* user_data,
+                                   uint64_t drop_count) {
+    auto* self = static_cast<RocpCSDK*>(user_data);
+    self->pcs_total_drops_ += drop_count;
+
+    std::lock_guard<std::mutex> lock(self->pcs_samples_mutex_);
+
+    for (size_t i = 0; i < num_headers; i++) {
+        auto* hdr = headers[i];
+        if (hdr->category != ROCPROFILER_BUFFER_CATEGORY_PC_SAMPLING)
+            continue;
+
+        rocp_csdk_pcs_sample_raw_t raw;
+        if (hdr->kind == ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE) {
+            raw.record_kind = hdr->kind;
+            raw.data.host_trap =
+                *static_cast<rocprofiler_pc_sampling_record_host_trap_v0_t*>(hdr->payload);
+        } else if (hdr->kind == ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE) {
+            raw.record_kind = hdr->kind;
+            raw.data.stochastic =
+                *static_cast<rocprofiler_pc_sampling_record_stochastic_v0_t*>(hdr->payload);
+        } else {
+            continue;
+        }
+
+        // Enforce buffer limit - drop oldest samples
+        while (self->pcs_samples_.size() >= self->pcs_max_samples_) {
+            self->pcs_samples_.pop_front();
+            self->pcs_total_drops_++;
+        }
+        self->pcs_samples_.push_back(raw);
+    }
+}
+
+int RocpCSDK::pcsQueryCapabilities(int device_id, rocp_csdk_pcs_caps_t* caps) {
+    if (!caps) return RETVAL_FAIL;
+
+    memset(caps, 0, sizeof(*caps));
+
+    // Cache PC sampling configurations if not done yet
+    if (!pcs_configs_cached_) {
+        pcs_agent_configs_.clear();
+
+        for (const auto& agent_pair : gpu_agents_) {
+            std::vector<pcs_config_info_t> configs;
+
+            auto cb = [](const rocprofiler_pc_sampling_configuration_t* cfgs,
+                         size_t num_cfgs, void* user_data) {
+                auto* vec = static_cast<std::vector<pcs_config_info_t>*>(user_data);
+                for (size_t i = 0; i < num_cfgs; i++) {
+                    vec->emplace_back(pcs_config_info_t{
+                        cfgs[i].method, cfgs[i].unit,
+                        cfgs[i].min_interval, cfgs[i].max_interval,
+                        cfgs[i].flags
+                    });
+                }
+                return ROCPROFILER_STATUS_SUCCESS;
+            };
+
+            rocprofiler_query_pc_sampling_agent_configurations(
+                agent_pair.second->id, cb, &configs);
+
+            pcs_agent_configs_[agent_pair.second->logical_node_type_id] = std::move(configs);
+        }
+        pcs_configs_cached_ = true;
+    }
+
+    // Find capabilities for the requested device
+    auto it = pcs_agent_configs_.find(static_cast<uint64_t>(device_id));
+    if (it == pcs_agent_configs_.end() && device_id >= 0) {
+        return RETVAL_FAIL;  // Device not found
+    }
+
+    // If device_id == -1, return capabilities of first device
+    if (pcs_agent_configs_.empty()) {
+        caps->supported = 0;
+        return RETVAL_SUCCESS;
+    }
+
+    const auto& configs = (device_id < 0)
+        ? pcs_agent_configs_.begin()->second
+        : it->second;
+
+    if (configs.empty()) {
+        caps->supported = 0;
+        return RETVAL_SUCCESS;
+    }
+
+    caps->supported = 1;
+    for (const auto& cfg : configs) {
+        if (cfg.method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC) {
+            caps->stochastic_available = 1;
+            caps->stochastic_min_interval = cfg.min_interval;
+            caps->stochastic_max_interval = cfg.max_interval;
+        } else if (cfg.method == ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP) {
+            caps->host_trap_available = 1;
+            caps->host_trap_min_interval = cfg.min_interval;
+            caps->host_trap_max_interval = cfg.max_interval;
+        }
+    }
+
+    return RETVAL_SUCCESS;
+}
+
+int RocpCSDK::pcsStart(const rocp_csdk_pcs_config_t* config) {
+    // Check mutual exclusion with counter profiling
+    if (active_state_ == ROCP_CSDK_AES_RUNNING) {
+        return RETVAL_FAIL;  // Counter profiling is active
+    }
+    if (pcs_active_) {
+        return RETVAL_FAIL;  // PC sampling already active
+    }
+
+    // Query configurations if not cached
+    if (!pcs_configs_cached_) {
+        rocp_csdk_pcs_caps_t dummy;
+        pcsQueryCapabilities(-1, &dummy);
+    }
+
+    // Create PC sampling context
+    ROCPROFILER_CALL(rocprofiler_create_context(&pcs_ctx_), "create PC sampling context");
+
+    pcs_max_samples_ = (config && config->max_samples > 0) ? config->max_samples : 10000;
+    pcs_samples_.clear();
+    pcs_total_drops_ = 0;
+    pcs_agent_states_.clear();
+    pcs_buffer_ids_.clear();
+
+    // Configure PC sampling for each agent
+    for (const auto& agent_pair : gpu_agents_) {
+        const auto* agent = agent_pair.second;
+        uint64_t logical_id = agent->logical_node_type_id;
+
+        // Skip if user specified a specific device and this isn't it
+        if (config && config->device_id >= 0 &&
+            static_cast<uint64_t>(config->device_id) != logical_id) {
+            continue;
+        }
+
+        auto cfg_it = pcs_agent_configs_.find(logical_id);
+        if (cfg_it == pcs_agent_configs_.end() || cfg_it->second.empty()) {
+            continue;  // No PC sampling support for this agent
+        }
+
+        // Select method (prefer stochastic if AUTO)
+        const pcs_config_info_t* picked_cfg = nullptr;
+        rocprofiler_pc_sampling_method_t desired_method = ROCPROFILER_PC_SAMPLING_METHOD_NONE;
+
+        if (config) {
+            if (config->method == ROCP_CSDK_PCS_METHOD_HOST_TRAP)
+                desired_method = ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP;
+            else if (config->method == ROCP_CSDK_PCS_METHOD_STOCHASTIC)
+                desired_method = ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC;
+        }
+
+        for (const auto& cfg : cfg_it->second) {
+            if (desired_method != ROCPROFILER_PC_SAMPLING_METHOD_NONE) {
+                if (cfg.method == desired_method) {
+                    picked_cfg = &cfg;
+                    break;
+                }
+            } else {
+                // AUTO: prefer stochastic
+                if (cfg.method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC) {
+                    picked_cfg = &cfg;
+                    break;
+                } else if (!picked_cfg) {
+                    picked_cfg = &cfg;
+                }
+            }
+        }
+
+        if (!picked_cfg) continue;
+
+        // Create buffer for this agent
+        rocprofiler_buffer_id_t buffer_id;
+        ROCPROFILER_CALL(rocprofiler_create_buffer(
+            pcs_ctx_,
+            64 * 1024,  // 64KB buffer
+            32 * 1024,  // Watermark
+            ROCPROFILER_BUFFER_POLICY_LOSSLESS,
+            &RocpCSDK::pcSamplingCallback,
+            this,
+            &buffer_id),
+            "create PC sampling buffer");
+
+        pcs_buffer_ids_.push_back(buffer_id);
+
+        // Determine interval
+        uint64_t interval = picked_cfg->min_interval;
+        if (config && config->interval > 0) {
+            interval = std::max(picked_cfg->min_interval,
+                               std::min(config->interval, picked_cfg->max_interval));
+        }
+
+        // Configure PC sampling service
+        ROCPROFILER_CALL(rocprofiler_configure_pc_sampling_service(
+            pcs_ctx_,
+            agent->id,
+            picked_cfg->method,
+            picked_cfg->unit,
+            interval,
+            buffer_id,
+            0),  // flags
+            "configure PC sampling service");
+
+        // Create and assign callback thread
+        rocprofiler_callback_thread_t cb_thread;
+        ROCPROFILER_CALL(rocprofiler_create_callback_thread(&cb_thread),
+                         "create callback thread");
+        ROCPROFILER_CALL(rocprofiler_assign_callback_thread(buffer_id, cb_thread),
+                         "assign callback thread");
+
+        pcs_agent_states_.push_back({
+            agent->id, logical_id, buffer_id, picked_cfg->method, true
+        });
+    }
+
+    if (pcs_agent_states_.empty()) {
+        return RETVAL_FAIL;  // No agents configured
+    }
+
+    // Start context
+    ROCPROFILER_CALL(rocprofiler_start_context(pcs_ctx_), "start PC sampling context");
+    pcs_active_ = true;
+
+    return RETVAL_SUCCESS;
+}
+
+int RocpCSDK::pcsStop() {
+    if (!pcs_active_) {
+        return RETVAL_SUCCESS;  // Already stopped
+    }
+
+    // Stop context
+    ROCPROFILER_CALL(rocprofiler_stop_context(pcs_ctx_), "stop PC sampling context");
+
+    // Flush and destroy buffers
+    for (auto& buf_id : pcs_buffer_ids_) {
+        ROCPROFILER_CALL(rocprofiler_flush_buffer(buf_id), "flush PC sampling buffer");
+        ROCPROFILER_CALL(rocprofiler_destroy_buffer(buf_id), "destroy PC sampling buffer");
+    }
+
+    pcs_buffer_ids_.clear();
+    pcs_agent_states_.clear();
+    pcs_active_ = false;
+
+    return RETVAL_SUCCESS;
+}
+
+int RocpCSDK::pcsRead(rocp_csdk_pcs_sample_t* samples, size_t* num_samples, size_t max) {
+    if (!samples || !num_samples) return RETVAL_FAIL;
+
+    std::lock_guard<std::mutex> lock(pcs_samples_mutex_);
+    size_t count = std::min(max, pcs_samples_.size());
+
+    for (size_t i = 0; i < count; i++) {
+        auto& raw = pcs_samples_.front();
+        auto& out = samples[i];
+        memset(&out, 0, sizeof(out));
+
+        if (raw.record_kind == ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE) {
+            auto& ht = raw.data.host_trap;
+            out.code_object_id = ht.pc.code_object_id;
+            out.code_object_offset = ht.pc.code_object_offset;
+            out.timestamp = ht.timestamp;
+            out.exec_mask = ht.exec_mask;
+            out.dispatch_id = ht.dispatch_id;
+            out.workgroup_x = ht.workgroup_id.x;
+            out.workgroup_y = ht.workgroup_id.y;
+            out.workgroup_z = ht.workgroup_id.z;
+            out.wave_in_group = ht.wave_in_group;
+            out.chiplet = ht.hw_id.chiplet;
+            out.cu_id = ht.hw_id.cu_or_wgp_id;
+            out.simd_id = ht.hw_id.simd_id;
+            out.shader_engine_id = ht.hw_id.shader_engine_id;
+            out.wave_issued = 1;  // Host trap doesn't distinguish
+            out.stall_reason = 0;
+        } else if (raw.record_kind == ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE) {
+            auto& st = raw.data.stochastic;
+            out.code_object_id = st.pc.code_object_id;
+            out.code_object_offset = st.pc.code_object_offset;
+            out.timestamp = st.timestamp;
+            out.exec_mask = st.exec_mask;
+            out.dispatch_id = st.dispatch_id;
+            out.workgroup_x = st.workgroup_id.x;
+            out.workgroup_y = st.workgroup_id.y;
+            out.workgroup_z = st.workgroup_id.z;
+            out.wave_in_group = st.wave_in_group;
+            out.chiplet = st.hw_id.chiplet;
+            out.cu_id = st.hw_id.cu_or_wgp_id;
+            out.simd_id = st.hw_id.simd_id;
+            out.shader_engine_id = st.hw_id.shader_engine_id;
+            out.wave_issued = st.wave_issued;
+            out.inst_type = st.inst_type;
+            out.stall_reason = st.snapshot.reason_not_issued;
+        }
+
+        pcs_samples_.pop_front();
+    }
+
+    *num_samples = count;
+    return RETVAL_SUCCESS;
+}
+
+int RocpCSDK::pcsReadRaw(rocp_csdk_pcs_sample_raw_t* samples, size_t* num_samples, size_t max) {
+    if (!samples || !num_samples) return RETVAL_FAIL;
+
+    std::lock_guard<std::mutex> lock(pcs_samples_mutex_);
+    size_t count = std::min(max, pcs_samples_.size());
+
+    for (size_t i = 0; i < count; i++) {
+        samples[i] = pcs_samples_.front();
+        pcs_samples_.pop_front();
+    }
+
+    *num_samples = count;
+    return RETVAL_SUCCESS;
+}
+
+uint64_t RocpCSDK::pcsGetDropCount() const {
+    return pcs_total_drops_.load();
+}
+
+int RocpCSDK::initPcSampling() {
+    // Query and cache PC sampling configurations
+    pcs_agent_configs_.clear();
+    for (const auto& agent_pair : gpu_agents_) {
+        std::vector<pcs_config_info_t> configs;
+
+        auto cb = [](const rocprofiler_pc_sampling_configuration_t* cfgs,
+                     size_t num_cfgs, void* user_data) {
+            auto* vec = static_cast<std::vector<pcs_config_info_t>*>(user_data);
+            for (size_t i = 0; i < num_cfgs; i++) {
+                vec->emplace_back(pcs_config_info_t{
+                    cfgs[i].method, cfgs[i].unit,
+                    cfgs[i].min_interval, cfgs[i].max_interval,
+                    cfgs[i].flags
+                });
+            }
+            return ROCPROFILER_STATUS_SUCCESS;
+        };
+
+        rocprofiler_query_pc_sampling_agent_configurations(
+            agent_pair.second->id, cb, &configs);
+
+        if (!configs.empty()) {
+            pcs_agent_configs_[agent_pair.second->logical_node_type_id] = std::move(configs);
+        }
+    }
+    pcs_configs_cached_ = true;
+
+    if (pcs_agent_configs_.empty()) {
+        // No agents support PC sampling
+        return -1;
+    }
+
+    // Create PC sampling context
+    ROCPROFILER_CALL(rocprofiler_create_context(&pcs_ctx_), "create PC sampling context");
+
+    // Read configuration from environment
+    pcs_max_samples_ = 50000;  // Default
+    if (const char* max_env = getenv("ROCP_CSDK_PCS_MAX_SAMPLES")) {
+        pcs_max_samples_ = std::strtoul(max_env, nullptr, 10);
+    }
+
+    // Determine method preference from environment
+    rocp_csdk_pcs_method_t method_pref = ROCP_CSDK_PCS_METHOD_AUTO;
+    if (const char* method_env = getenv("ROCP_CSDK_PCS_METHOD")) {
+        if (strcmp(method_env, "host_trap") == 0) {
+            method_pref = ROCP_CSDK_PCS_METHOD_HOST_TRAP;
+        } else if (strcmp(method_env, "stochastic") == 0) {
+            method_pref = ROCP_CSDK_PCS_METHOD_STOCHASTIC;
+        }
+    }
+
+    // Determine interval from environment (0 = use default)
+    uint64_t interval_pref = 0;
+    if (const char* interval_env = getenv("ROCP_CSDK_PCS_INTERVAL")) {
+        interval_pref = std::strtoull(interval_env, nullptr, 10);
+    }
+
+    pcs_samples_.clear();
+    pcs_total_drops_ = 0;
+    pcs_agent_states_.clear();
+    pcs_buffer_ids_.clear();
+
+    // Configure PC sampling for each GPU agent
+    for (const auto& agent_pair : gpu_agents_) {
+        const auto* agent = agent_pair.second;
+        uint64_t logical_id = agent->logical_node_type_id;
+
+        auto cfg_it = pcs_agent_configs_.find(logical_id);
+        if (cfg_it == pcs_agent_configs_.end() || cfg_it->second.empty()) {
+            continue;
+        }
+
+        // Select configuration (prefer stochastic if AUTO)
+        const pcs_config_info_t* picked_cfg = nullptr;
+        rocprofiler_pc_sampling_method_t desired_method = ROCPROFILER_PC_SAMPLING_METHOD_NONE;
+
+        if (method_pref == ROCP_CSDK_PCS_METHOD_HOST_TRAP)
+            desired_method = ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP;
+        else if (method_pref == ROCP_CSDK_PCS_METHOD_STOCHASTIC)
+            desired_method = ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC;
+
+        for (const auto& cfg : cfg_it->second) {
+            if (desired_method != ROCPROFILER_PC_SAMPLING_METHOD_NONE) {
+                if (cfg.method == desired_method) {
+                    picked_cfg = &cfg;
+                    break;
+                }
+            } else {
+                // AUTO: prefer stochastic
+                if (cfg.method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC) {
+                    picked_cfg = &cfg;
+                    break;
+                } else if (!picked_cfg) {
+                    picked_cfg = &cfg;
+                }
+            }
+        }
+
+        if (!picked_cfg) continue;
+
+        // Create buffer for this agent
+        rocprofiler_buffer_id_t buffer_id;
+        ROCPROFILER_CALL(rocprofiler_create_buffer(
+            pcs_ctx_,
+            64 * 1024,  // 64KB buffer
+            32 * 1024,  // Watermark
+            ROCPROFILER_BUFFER_POLICY_LOSSLESS,
+            &RocpCSDK::pcSamplingCallback,
+            this,
+            &buffer_id),
+            "create PC sampling buffer");
+
+        pcs_buffer_ids_.push_back(buffer_id);
+
+        // Determine interval
+        uint64_t interval;
+        if (picked_cfg->method == ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC) {
+            // Default: 2^20 cycles for stochastic
+            interval = (interval_pref > 0) ? interval_pref : 1048576;
+        } else {
+            // Default: 10000 microseconds (10ms) for host trap
+            interval = (interval_pref > 0) ? interval_pref : 10000;
+        }
+        // Clamp to valid range
+        interval = std::max(picked_cfg->min_interval,
+                           std::min(interval, picked_cfg->max_interval));
+
+        // Configure PC sampling service
+        rocprofiler_status_t status = rocprofiler_configure_pc_sampling_service(
+            pcs_ctx_,
+            agent->id,
+            picked_cfg->method,
+            picked_cfg->unit,
+            interval,
+            buffer_id,
+            0);
+
+        if (status != ROCPROFILER_STATUS_SUCCESS) {
+            continue;  // Skip this agent
+        }
+
+        // Create and assign callback thread
+        rocprofiler_callback_thread_t cb_thread;
+        ROCPROFILER_CALL(rocprofiler_create_callback_thread(&cb_thread),
+                         "create callback thread");
+        ROCPROFILER_CALL(rocprofiler_assign_callback_thread(buffer_id, cb_thread),
+                         "assign callback thread");
+
+        pcs_agent_states_.push_back({
+            agent->id, logical_id, buffer_id, picked_cfg->method, true
+        });
+    }
+
+    if (pcs_agent_states_.empty()) {
+        return -1;  // No agents configured
+    }
+
+    // Start context immediately
+    ROCPROFILER_CALL(rocprofiler_start_context(pcs_ctx_), "start PC sampling context");
+    pcs_active_ = true;
+
+    return 0;
+}
+
+//--------------------------------------------------------------------------------
 // Agent Management
 //--------------------------------------------------------------------------------
 
@@ -556,10 +1053,17 @@ int RocpCSDK::setProfileCache() {
 int RocpCSDK::init(rocprofiler_client_finalize_t fini_func, void* tool_data) {
     if (nullptr != getenv("ROCP_CSDK_DISPATCH_MODE")) {
         profiling_mode_ = ROCP_CSDK_MODE_DISPATCH;
+    } else if (nullptr != getenv("ROCP_CSDK_PC_SAMPLING_MODE")) {
+        profiling_mode_ = ROCP_CSDK_MODE_PC_SAMPLING;
     }
 
     // Obtain the list of available (GPU) agents.
     gpu_agents_ = getGPUAgentInfo();
+
+    if (ROCP_CSDK_MODE_PC_SAMPLING == getProfilingMode()) {
+        // PC Sampling mode - initialize during tool_init
+        return initPcSampling();
+    }
 
     ROCPROFILER_CALL(rocprofiler_create_context(&getClientCtx()), "context creation");
 
@@ -593,8 +1097,22 @@ int RocpCSDK::init(rocprofiler_client_finalize_t fini_func, void* tool_data) {
 }
 
 void RocpCSDK::fini(void* tool_data) {
-    stopCounting();
-    emptyActiveEventSet();
+    if (profiling_mode_ == ROCP_CSDK_MODE_PC_SAMPLING) {
+        // Stop PC sampling and flush buffers
+        if (pcs_active_) {
+            ROCPROFILER_CALL(rocprofiler_stop_context(pcs_ctx_), "stop PC sampling context");
+            pcs_active_ = false;
+        }
+        for (auto& buf_id : pcs_buffer_ids_) {
+            ROCPROFILER_CALL(rocprofiler_flush_buffer(buf_id), "flush PC sampling buffer");
+            ROCPROFILER_CALL(rocprofiler_destroy_buffer(buf_id), "destroy PC sampling buffer");
+        }
+        pcs_buffer_ids_.clear();
+        pcs_agent_states_.clear();
+    } else {
+        stopCounting();
+        emptyActiveEventSet();
+    }
 }
 
 //--------------------------------------------------------------------------------
@@ -775,6 +1293,35 @@ rocp_csdk_read(long long* values) {
         values[i] = tmp_val[i];
     }
     return ret_val;
+}
+
+//--------------------------------------------------------------------------------
+// PC Sampling C API
+//--------------------------------------------------------------------------------
+
+extern "C" int
+rocp_csdk_pcs_query_support(int device_id, rocp_csdk_pcs_caps_t* caps) {
+    return RocpCSDK::instance().pcsQueryCapabilities(device_id, caps);
+}
+
+extern "C" int
+rocp_csdk_pcs_start(rocp_csdk_pcs_config_t* config) {
+    return RocpCSDK::instance().pcsStart(config);
+}
+
+extern "C" int
+rocp_csdk_pcs_stop(void) {
+    return RocpCSDK::instance().pcsStop();
+}
+
+extern "C" int
+rocp_csdk_pcs_read(rocp_csdk_pcs_sample_t* samples, size_t* num_samples, size_t max_samples) {
+    return RocpCSDK::instance().pcsRead(samples, num_samples, max_samples);
+}
+
+extern "C" uint64_t
+rocp_csdk_pcs_get_drop_count(void) {
+    return RocpCSDK::instance().pcsGetDropCount();
 }
 
 //--------------------------------------------------------------------------------

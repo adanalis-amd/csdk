@@ -16,7 +16,7 @@ ifneq ($(GPUARCH),)
 endif
 GPUFLAGS=$(ARCHFLAG) --hip-link --rtlib=compiler-rt -unwindlib=libgcc
 
-TESTS = driver
+TESTS = driver driver_pcs
 template_tests: $(TESTS)
 
 %.o: %.c
@@ -30,6 +30,12 @@ kernel.o: kernel.cpp
 
 driver: driver.o kernel.o rocp_csdk
 	$(AMDCXX) -g $(GPUFLAGS) driver.o kernel.o -o driver $(LDFLAGS) -pthread -L. -lcntr $(ROCP_SDK_INCL)
+
+driver_pcs.o: driver_pcs.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(OPTFLAGS) -D__HIP_PLATFORM_AMD__ -g -c -o $@ $<
+
+driver_pcs: driver_pcs.o kernel.o rocp_csdk
+	$(AMDCXX) -g $(GPUFLAGS) driver_pcs.o kernel.o -o driver_pcs $(LDFLAGS) -pthread -L. -lcntr $(ROCP_SDK_INCL)
 
 clean:
 	rm -f $(TESTS) *.o *.so

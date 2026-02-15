@@ -8,6 +8,7 @@
 #include <rocprofiler-sdk/registration.h>
 #include <rocprofiler-sdk/device_counting_service.h>
 #include <rocprofiler-sdk/rocprofiler.h>
+#include <rocprofiler-sdk/pc_sampling.h>
 
 #include <dlfcn.h>
 #include <cxxabi.h>
@@ -26,6 +27,7 @@
 #include <map>
 #include <unordered_map>
 #include <list>
+#include <deque>
 #include <mutex>
 #if (__cplusplus >= 201402L) // c++14
 #include <shared_mutex>
@@ -55,8 +57,7 @@
 #define ROCPROFILER_CALL(result, msg) {(void)result;}
 #endif
 
-#define ROCP_CSDK_MODE_DISPATCH        (0)
-#define ROCP_CSDK_MODE_DEVICE_SAMPLING (1)
+// Note: ROCP_CSDK_MODE_* macros are defined in rocp_csdk.h
 
 #define ROCP_CSDK_AES_STOPPED (0x0)
 #define ROCP_CSDK_AES_OPEN    (0x1)
@@ -90,6 +91,32 @@ struct rec_info_t {
     rocprofiler_counter_id_t counter_id;
     uint64_t device;
     dim_vector_t recorded_dims;
+};
+
+// PC Sampling internal structures
+struct pcs_agent_state_t {
+    rocprofiler_agent_id_t agent_id;
+    uint64_t logical_device_id;
+    rocprofiler_buffer_id_t buffer_id;
+    rocprofiler_pc_sampling_method_t method;
+    bool configured;
+};
+
+struct pcs_config_info_t {
+    rocprofiler_pc_sampling_method_t method;
+    rocprofiler_pc_sampling_unit_t unit;
+    uint64_t min_interval;
+    uint64_t max_interval;
+    uint64_t flags;
+};
+
+// Raw PC sample (preserves original rocprofiler format)
+struct rocp_csdk_pcs_sample_raw_t {
+    int record_kind;  // HOST_TRAP_V0 or STOCHASTIC_V0
+    union {
+        rocprofiler_pc_sampling_record_host_trap_v0_t host_trap;
+        rocprofiler_pc_sampling_record_stochastic_v0_t stochastic;
+    } data;
 };
 
 /**
@@ -130,6 +157,15 @@ public:
     int getEventCount() const;
     rocprofiler_context_id_t& getClientCtx();
     rocprofiler_buffer_id_t& getBuffer();
+
+    // PC Sampling control
+    int initPcSampling();
+    int pcsQueryCapabilities(int device_id, rocp_csdk_pcs_caps_t* caps);
+    int pcsStart(const rocp_csdk_pcs_config_t* config);
+    int pcsStop();
+    int pcsRead(rocp_csdk_pcs_sample_t* samples, size_t* num_samples, size_t max);
+    int pcsReadRaw(rocp_csdk_pcs_sample_raw_t* samples, size_t* num_samples, size_t max);
+    uint64_t pcsGetDropCount() const;
 
 private:
     // Private constructor for singleton
@@ -174,6 +210,13 @@ private:
                                  void* user_data,
                                  uint64_t drop_count);
 
+    static void pcSamplingCallback(rocprofiler_context_id_t context_id,
+                                   rocprofiler_buffer_id_t buffer_id,
+                                   rocprofiler_record_header_t** headers,
+                                   size_t num_headers,
+                                   void* user_data,
+                                   uint64_t drop_count);
+
     std::atomic<unsigned int> global_event_count_{0};
     std::atomic<unsigned int> base_event_count_{0};
 
@@ -208,6 +251,19 @@ private:
 
     rocprofiler_context_id_t client_ctx_;
     rocprofiler_buffer_id_t buffer_;
+
+    // PC Sampling state
+    std::atomic<bool> pcs_active_{false};
+    rocprofiler_context_id_t pcs_ctx_;
+    std::vector<pcs_agent_state_t> pcs_agent_states_;
+    std::unordered_map<uint64_t, std::vector<pcs_config_info_t>> pcs_agent_configs_;
+    std::vector<rocprofiler_buffer_id_t> pcs_buffer_ids_;
+
+    std::mutex pcs_samples_mutex_;
+    std::deque<rocp_csdk_pcs_sample_raw_t> pcs_samples_;
+    size_t pcs_max_samples_{10000};
+    std::atomic<uint64_t> pcs_total_drops_{0};
+    bool pcs_configs_cached_{false};
 };
 
 #endif
