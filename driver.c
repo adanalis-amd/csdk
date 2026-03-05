@@ -1,18 +1,21 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #include "hip.h"
 #include "rocp_csdk.h"
 
-#define NUM_EVENTS (15)
-//#define NUM_EVENTS (3)
-#define SAMPLE_INTERVAL_US (80 * 1000)
+//#define NUM_EVENTS (15)
+#define NUM_EVENTS (2)
+#define SAMPLE_INTERVAL_US (50 * 1000)
 
 extern int launch_kernel(int device_id);
 
 
 const char *desiredEvents[NUM_EVENTS] = {
+/*
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=0",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=1",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=2",
@@ -21,30 +24,52 @@ const char *desiredEvents[NUM_EVENTS] = {
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=5",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=6",
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:DIMENSION_INSTANCE=0:DIMENSION_XCC=7",
+*/
     "CPF_CMP_UTCL1_STALL_ON_TRANSLATION:device=0",
-    "SQ_WAVES:device=0",
+    "SQ_WAVES:device=0"/*,
     "SQ_WAVES:device=1",
     "SQ_WAVES:device=2",
     "SQ_WAVES:device=3",
     "SQ_WAVES:device=4",
-    "SQ_WAVES:device=5"
+    "SQ_WAVES:device=5" */
 };
 
 atomic_int gv = 0;
 
 void *thread_main(void *arg){
+    int ret_val;
     long long counters[NUM_EVENTS] = { 0 };
+    roctx_thread_id_t tid;
+
     while(0 == atomic_load(&gv)){;}
-    for(int i=0; i<10; i++){
+
+    // get the thread id recognized by rocprofiler-sdk from roctx
+    roctxGetThreadId(&tid);
+    for(int i=0; i<20; i++){
+        if( i == 4 ){
+            // pause API tracing
+            roctxProfilerPause(tid);
+            printf("----- Profiling paused with roctxProfilerPause(tid)\n");
+        }
+        if( i == 12 ){
+            // resume API tracing
+            roctxProfilerResume(tid);
+            printf("----- Profiling resumed with roctxProfilerResume(tid)\n");
+        }
         printf("Sample: %2d\n", atomic_load(&gv));
         fflush(stdout);
-        rocp_csdk_read(counters);
+        ret_val = rocp_csdk_read(counters);
+        if( RETVAL_SUCCESS != ret_val ){
+            printf("####-> READ ERROR.\n");
+        }
         for (int j = 0; j < NUM_EVENTS; ++j) {
             printf("%s: %lld\n", desiredEvents[j], counters[j]);
             fflush(stdout);
         }
         printf("\n------------------------------------------\n");
         fflush(stdout);
+        // clean the previous reading.
+        memset(counters, 0, NUM_EVENTS*sizeof(long long));
         usleep(SAMPLE_INTERVAL_US);
         atomic_fetch_add(&gv, 1);
     }
@@ -79,10 +104,10 @@ int main(int argc, char *argv[])
         fprintf(stderr, "launch_kernel failed with code %d\n", kernel_ret);
     }
 
+    printf("==== Kernel has finished.\n");
+
     pthread_join(tid, NULL);
-
     rocp_csdk_stop();
-
     rocp_csdk_shutdown();
 
     return 0;

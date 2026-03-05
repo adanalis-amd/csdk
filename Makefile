@@ -8,7 +8,7 @@ ROCP_SDK_INCL=-I$(ROCP_SDK_ROOT)/include     \
 AMDCXX   ?= amdclang++
 CFLAGS    = $(OPTFLAGS)
 CPPFLAGS += $(INCLUDE) $(ROCP_SDK_INCL)
-LDFLAGS  += -L$(ROCP_SDK_ROOT)/lib -lrocprofiler-sdk
+LDFLAGS  += -L$(ROCP_SDK_ROOT)/lib -lrocprofiler-sdk -lrocprofiler-sdk-roctx
 
 GPUARCH = $(shell rocm_agent_enumerator 2>/dev/null | grep -v "gfx000" | head -1)
 ifneq ($(GPUARCH),)

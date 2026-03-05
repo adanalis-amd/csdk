@@ -19,6 +19,7 @@ kernelA(int x, int y)
 {
     volatile int i, t;
     for(i=0; i<1000000; i++){
+//    for(i=0; i<10000; i++){
         t = 173/x;
         x = t + y;
     }

@@ -66,6 +66,30 @@ int RocpCSDK::getEventCount() const {
 // Helper Methods
 //--------------------------------------------------------------------------------
 
+
+void
+RocpCSDK::toolControlInit(rocprofiler_context_id_t& primary_ctx) {
+    // Create a specialized (throw-away) context for handling ROCTx profiler pause and resume.
+    // A separate context is used because if the context that is associated with roctxProfilerPause
+    // disabled that same context, a call to roctxProfilerResume would be ignored because the
+    // context that enables the callback for that API call is disabled.
+    auto cntrl_ctx = rocprofiler_context_id_t{0};
+    ROCPROFILER_CALL(rocprofiler_create_context(&cntrl_ctx), "control context creation failed");
+
+    // enable callback marker tracing with only the pause/resume operations
+    ROCPROFILER_CALL(rocprofiler_configure_callback_tracing_service(
+                         cntrl_ctx,
+                         ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API,
+                         nullptr,
+                         0,
+                         &RocpCSDK::toolTracingCtrlCallback,
+                         &primary_ctx),
+                     "callback tracing service failed to configure");
+
+    // start the context so that it is always active
+    ROCPROFILER_CALL(rocprofiler_start_context(cntrl_ctx), "start of control context");
+}
+
 /**
  * For a given counter, query the dimensions that it has.
  */
@@ -116,6 +140,26 @@ bool RocpCSDK::dimensionsMatch(dim_vector_t dim_instances, dim_vector_t recorded
 //--------------------------------------------------------------------------------
 // Static Callbacks
 //--------------------------------------------------------------------------------
+
+
+void RocpCSDK::toolTracingCtrlCallback(rocprofiler_callback_tracing_record_t record,
+                           rocprofiler_user_data_t*,
+                           void* client_data) {
+    auto* ctx = static_cast<rocprofiler_context_id_t*>(client_data);
+
+    if(record.phase == ROCPROFILER_CALLBACK_PHASE_ENTER &&
+       record.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API &&
+       record.operation == ROCPROFILER_MARKER_CONTROL_API_ID_roctxProfilerPause)
+    {
+        ROCPROFILER_CALL(rocprofiler_stop_context(*ctx), "pausing client context");
+    }
+    else if(record.phase == ROCPROFILER_CALLBACK_PHASE_EXIT &&
+            record.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API &&
+            record.operation == ROCPROFILER_MARKER_CONTROL_API_ID_roctxProfilerResume)
+    {
+        ROCPROFILER_CALL(rocprofiler_start_context(*ctx), "resuming client context");
+    }
+}
 
 void RocpCSDK::recordCallback(rocprofiler_dispatch_counting_service_data_t dispatch_data,
                               rocprofiler_record_counter_t* record_data,
@@ -563,6 +607,9 @@ int RocpCSDK::init(rocprofiler_client_finalize_t fini_func, void* tool_data) {
 
     ROCPROFILER_CALL(rocprofiler_create_context(&getClientCtx()), "context creation");
 
+    // Enable support for Pause/Resume
+    RocpCSDK::toolControlInit(getClientCtx());
+
     if (ROCP_CSDK_MODE_DEVICE_SAMPLING == getProfilingMode()) {
         ROCPROFILER_CALL(rocprofiler_create_buffer(getClientCtx(),
                                                    32 * 1024,
@@ -767,6 +814,9 @@ rocp_csdk_read(long long* values) {
     // If the collection mode is DEVICE_SAMPLING get an explicit sample.
     if (ROCP_CSDK_MODE_DEVICE_SAMPLING == sdk.getProfilingMode()) {
         ret_val = sdk.readSample();
+        if (ret_val != RETVAL_SUCCESS) {
+            return ret_val;
+        }
     }
 
     int cnt = sdk.getEventCount();

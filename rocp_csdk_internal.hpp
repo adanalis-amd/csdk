@@ -142,6 +142,7 @@ private:
 
     // Initialization helpers
     agent_map_t getGPUAgentInfo();
+    void toolControlInit(rocprofiler_context_id_t&);
 
     // Event processing
     std::vector<rocprofiler_record_dimension_info_t> counterDimensions(rocprofiler_counter_id_t counter);
@@ -173,6 +174,10 @@ private:
                                  size_t num_headers,
                                  void* user_data,
                                  uint64_t drop_count);
+
+    static void toolTracingCtrlCallback(rocprofiler_callback_tracing_record_t record,
+                           rocprofiler_user_data_t*,
+                           void* client_data);
 
     std::atomic<unsigned int> global_event_count_{0};
     std::atomic<unsigned int> base_event_count_{0};
